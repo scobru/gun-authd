@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Gun AuthD CDN Test</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/gun/sea.js"></script>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "gun": "data:text/javascript;charset=utf-8,export default window.Gun;",
+            "gun/sea.js": "data:text/javascript;charset=utf-8,export default window.SEA;"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import "../dist/gun-authd.min.js"; 
+
+        // Inizializza Gun
+        // localStorage: false è utile nei test rapidi per evitare errori di scrittura su disco browser
+        const gun = Gun({
+            peers: ['https://shogun-relay.scobrudot.dev/gun'],
+            localStorage: false,
+            radisk: false
+        });
+
+        console.log("--- Test avvio ---");
+
+        // 4. Esegui Auth (ora puoi usare gun.user().auth() direttamente!)
+        // gun.authd() funziona ancora per retrocompatibilità
+        gun.user().auth("scobru", "francos88", (ack) => {
+            const outputDiv = document.getElementById("output");
+            
+            // Gestione Errore
+            if (ack.err) {
+                console.error("Errore Auth:", ack.err);
+                outputDiv.innerHTML = `<div style="color:red; font-weight:bold">Errore: ${ack.err}</div>`;
+                return;
+            }
+
+            // SUCCESSO
+            console.log("Auth OK!", ack);
+
+            // 5. Creiamo un oggetto "pulito" da mostrare (senza riferimenti circolari di Gun)
+            const safeData = {
+                status: "Successo",
+                alias: ack.alias,
+                pubKey: ack.sea.pub,
+                // Non includiamo tutto 'ack' o 'gun' qui dentro per evitare il crash JSON
+            };
+
+            outputDiv.innerHTML = `
+                <div style="border: 2px solid green; padding: 20px; border-radius: 8px; background: #f0fff4;">
+                    <h2 style="margin-top:0; color: green;">Autenticazione Riuscita!</h2>
+                    <p><strong>Alias:</strong> ${safeData.alias}</p>
+                    <p><strong>Chiave Pubblica (Deterministica):</strong></p>
+                    <code style="background: #333; color: #fff; padding: 5px; display: block; word-break: break-all;">
+                        ${safeData.pubKey}
+                    </code>
+                    <hr>
+                    <p><em>Oggetto Dati (JSON Safe):</em></p>
+                    <pre>${JSON.stringify(safeData, null, 2)}</pre>
+                </div>
+            `;
+        });
+    </script>
+</head>
+<body style="font-family: sans-serif; padding: 20px;">
+    <h1>Gun AuthD CDN Test</h1>
+    <div id="output">In attesa di autenticazione...</div>
+</body>
+</html>

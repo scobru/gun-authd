@@ -1,0 +1,20 @@
+{
+    "name": "gun-authd",
+    "version": "1.0.0",
+    "description": "Estensione per GunDB che permette login deterministico (senza salt casuali) e registrazione alias.",
+    "main": "./dist/gun-authd.min.js",
+    "type": "module",
+    "scripts": {
+        "build": "esbuild ./src/gun-authd.js --bundle --minify --outfile=./dist/gun-authd.min.js --format=esm --external:gun"
+    },
+    "dependencies": {
+        "@noble/curves": "^1.2.0",
+        "@noble/hashes": "^1.3.2",
+        "gun": "^0.2020.1239"
+    },
+    "author": "",
+    "license": "ISC",
+    "devDependencies": {
+        "esbuild": "^0.27.1"
+    }
+}
