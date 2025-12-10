@@ -46,6 +46,7 @@ By default, `gun.user().create()` works like this:
 * **Deterministic:** `Username` + `Password` will *always* generate the exact same Private Key.
 * **Graph Compatible:** It manually handles the `~@alias` -> `~pubkey` linking, so your user is still discoverable by others in the Gun network.
 * **Memory-Hard:** Argon2id is resistant to GPU/ASIC attacks unlike PBKDF2.
+* **Username Protection:** Automatically prevents login if username already exists with a different password, protecting existing accounts from unauthorized access attempts.
 
 ---
 
@@ -63,6 +64,7 @@ By default, `gun.user().create()` works like this:
 | **Audited Libraries** | Uses `@noble/curves`, `@noble/hashes`, `hash-wasm` |
 | **Password Validation** | Built-in strength checking (can be disabled) |
 | **Deterministic Recovery** | Can regenerate identity on any device with just username/password |
+| **Username Protection** | Prevents login if username exists with different password, protecting accounts from unauthorized access |
 
 ### ⚠️ Weaknesses & Risks
 
@@ -259,6 +261,41 @@ if (isValid) {
 }
 ```
 
+### Username Protection & Account Security
+
+**gun-authd** automatically protects existing usernames from unauthorized access:
+
+* **Existing Username Check:** Before authenticating, `gun-authd` checks if the username already exists in the graph.
+* **Password Verification:** If the username exists, it verifies that the provided password generates the same public key as the existing account.
+* **Access Denied:** If the password doesn't match, authentication fails with error: `"Wrong password for this username"`.
+* **New Account Creation:** If the username doesn't exist, a new account is created automatically.
+
+This prevents:
+- Unauthorized access attempts to existing accounts
+- Accidental account overwrites
+- Security vulnerabilities from weak password reuse
+
+**Example:**
+
+```javascript
+// First time - creates new account
+gun.user().auth("alice", "password123", (ack) => {
+    console.log("Account created:", ack.pub);
+});
+
+// Later - correct password, login succeeds
+gun.user().auth("alice", "password123", (ack) => {
+    console.log("Login successful:", ack.alias);
+});
+
+// Wrong password - access denied
+gun.user().auth("alice", "wrong-password", (ack) => {
+    if (ack.err) {
+        console.error(ack.err); // "Wrong password for this username"
+    }
+});
+```
+
 ### Disable Password Validation
 
 If you want to handle password validation yourself:
@@ -426,11 +463,26 @@ The derived keys are used as private key scalars for P-256 curves:
 | **Sign Keys** | ECDSA P-256 | Signing data, proving identity |
 | **Encrypt Keys** | ECDH P-256 | Deriving shared secrets for encryption |
 
-### 4. Graph Registration
+### 4. Username Protection & Verification
 
-When you call `gun.user().auth()`:
+Before authenticating, `gun-authd` performs a security check:
 
-1. `~@username` is linked to `~your_public_key` (alias index)
+1. **Check Username Existence:** Queries the `~@username` node to see if the username is already registered
+2. **Password Verification:** If username exists, generates the deterministic pair and compares the public key:
+   - ✅ **Match:** Password is correct, proceed with authentication
+   - ❌ **Mismatch:** Password is wrong, return error `"Wrong password for this username"`
+3. **New Account:** If username doesn't exist, creates a new account automatically
+
+This prevents:
+- Unauthorized access to existing accounts
+- Accidental account overwrites
+- Security vulnerabilities from password reuse
+
+### 5. Graph Registration
+
+When authentication succeeds:
+
+1. `~@username` is linked to `~your_public_key` (alias index) - only if new account
 2. User node is populated with `pub` and `epub` keys
 3. Other users can now discover you and send encrypted messages
 

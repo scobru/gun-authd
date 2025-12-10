@@ -279,8 +279,101 @@ function applyAuthOverride() {
       }
     }
     
-    // Generate deterministic pair using Argon2id + HKDF
+    // Generate deterministic pair first, then check if username already exists
     generateDeterministicPair(alias, pass).then((deterministicPair) => {
+      // Check if username already exists and verify it matches this public key
+      const aliasNode = root.get('~@' + alias);
+      const userNode = root.get('~' + deterministicPair.pub);
+      let checksDone = 0;
+      let existingPub = null;
+      let userNodeHasData = false;
+      let checkTimeout = null;
+      
+      // Helper to proceed when all checks are done
+      function checkComplete() {
+        checksDone++;
+        if (checksDone < 2) return; // Wait for both checks
+        
+        if (checkTimeout) clearTimeout(checkTimeout);
+        
+        // If username exists, verify it matches the generated public key
+        if (existingPub) {
+          if (deterministicPair.pub !== existingPub) {
+            cat.ing = false;
+            debugLog("Password does not match existing username");
+            debugLog("Expected pub:", existingPub.slice(0, 20) + "...");
+            debugLog("Generated pub:", deterministicPair.pub.slice(0, 20) + "...");
+            if (cb) cb({ err: "Wrong password for this username" });
+            return gun;
+          }
+          debugLog("Password matches existing username, proceeding with auth");
+          // Username exists and password matches - proceed with login (don't write index)
+          proceedWithAuth(deterministicPair, existingPub);
+        } else if (userNodeHasData) {
+          // User node exists but username index doesn't - user exists, just missing index
+          debugLog("User node exists but index missing, proceeding with auth and writing index");
+          proceedWithAuth(deterministicPair, null); // Pass null to write index
+        } else {
+          debugLog("Username does not exist, creating new user");
+          // Username doesn't exist - create new account
+          proceedWithAuth(deterministicPair, null);
+        }
+      }
+      
+      // Set timeout for username check (2 seconds)
+      checkTimeout = setTimeout(() => {
+        if (checksDone < 2) {
+          checksDone = 2;
+          checkComplete();
+        }
+      }, 2000);
+      
+      // Check if username exists in alias index
+      aliasNode.once((data) => {
+        if (checksDone >= 2) return;
+        
+        // Extract public key from the alias node
+        if (data && typeof data === 'object') {
+          // Gun stores data as { "~pubkey": { "#": "~pubkey" } }
+          const keys = Object.keys(data);
+          for (const key of keys) {
+            // Skip Gun internal keys
+            if (key === '_' || key.startsWith('_')) continue;
+            // Extract public key (remove ~ prefix)
+            if (key.startsWith('~')) {
+              existingPub = key.replace('~', '');
+              break;
+            }
+          }
+        }
+        
+        checkComplete();
+      });
+      
+      // Also check if user node exists (in case index hasn't been written yet)
+      userNode.once((data) => {
+        if (checksDone >= 2) return;
+        
+        // Check if user node has any data (means user exists)
+        if (data && typeof data === 'object') {
+          const keys = Object.keys(data);
+          // If there are keys other than Gun internals, user exists
+          const hasData = keys.some(key => key !== '_' && !key.startsWith('_'));
+          if (hasData) {
+            userNodeHasData = true;
+          }
+        }
+        
+        checkComplete();
+      });
+    }).catch((e) => {
+      cat.ing = false;
+      console.error("Key generation error:", e);
+      if (cb) cb({ err: "Internal error: " + e.message });
+    });
+    
+    // Helper function to proceed with authentication after username check
+    function proceedWithAuth(deterministicPair, existingPublicKey) {
       const user = (root._).user;
       const at_old = (user._);
       const upt = at_old.opt;
@@ -326,28 +419,27 @@ function applyAuthOverride() {
       if (cb) cb(ack);
       
       // Write global index and user profile (background)
-      const userSoul = "~" + deterministicPair.pub;
-      const gunUser = root.user();
-      
-      const aliasNode = {};
-      aliasNode[userSoul] = { '#': userSoul };
-      
-      root.get('~@' + alias).put(aliasNode, (ackGlobal) => {
-        if (ackGlobal.err) console.warn("Index warning:", ackGlobal.err);
+      // Write index if username doesn't exist yet (new account or missing index)
+      if (!existingPublicKey) {
+        const userSoul = "~" + deterministicPair.pub;
+        const gunUser = root.user();
         
-        gunUser.put({ 
-          alias: alias,
-          pub: deterministicPair.pub, 
-          epub: deterministicPair.epub
-        }, (ackPut) => {
-          debugLog("User profile written");
+        const aliasNode = {};
+        aliasNode[userSoul] = { '#': userSoul };
+        
+        root.get('~@' + alias).put(aliasNode, (ackGlobal) => {
+          if (ackGlobal.err) console.warn("Index warning:", ackGlobal.err);
+          
+          gunUser.put({ 
+            alias: alias,
+            pub: deterministicPair.pub, 
+            epub: deterministicPair.epub
+          }, (ackPut) => {
+            debugLog("User profile written");
+          });
         });
-      });
-    }).catch((e) => {
-      cat.ing = false;
-      console.error("Key generation error:", e);
-      if (cb) cb({ err: "Internal error: " + e.message });
-    });
+      }
+    }
     
     return gun;
   };
