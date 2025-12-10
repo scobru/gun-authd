@@ -1,6 +1,6 @@
-# gun-authd: Deterministic Authentication for GunDB
+# gun-authd v2: Deterministic Authentication for GunDB
 
-**gun-authd** is a specialized extension for [GunDB](https://gun.eco/) that enables purely deterministic user authentication.
+**gun-authd** is a specialized extension for [GunDB](https://gun.eco/) that enables purely deterministic user authentication using **Argon2id** and **HKDF**.
 
 It allows users to generate their SEA (Security, Encryption, Authorization) key pairs locally based solely on their username and password, **without needing to fetch a random salt from the network**.
 
@@ -12,9 +12,11 @@ It allows users to generate their SEA (Security, Encryption, Authorization) key 
 
 - [The Problem](#-the-problem-with-standard-gun-auth)
 - [The Solution](#-the-gun-authd-solution)
-- [Security Assessment](#-security-assessment)
+- [Security Assessment](#️-security-assessment)
 - [Installation](#-installation)
 - [Usage](#-usage)
+- [API Reference](#-api-reference)
+- [TypeScript Support](#-typescript-support)
 - [How It Works](#️-how-it-works-under-the-hood)
 - [Important Trade-offs](#️-important-trade-offs)
 - [Who Should Use This](#-who-should-use-this)
@@ -38,11 +40,12 @@ By default, `gun.user().create()` works like this:
 
 ## ✅ The gun-authd Solution
 
-**gun-authd** removes the random salt. Instead, it uses **PBKDF2** (Username + Password) to mathematically derive your keys.
+**gun-authd** removes the random salt. Instead, it uses **Argon2id + HKDF** to mathematically derive your keys.
 
 * **Zero Lookup:** Login is instant. No network request needed to "find" the user first.
 * **Deterministic:** `Username` + `Password` will *always* generate the exact same Private Key.
 * **Graph Compatible:** It manually handles the `~@alias` -> `~pubkey` linking, so your user is still discoverable by others in the Gun network.
+* **Memory-Hard:** Argon2id is resistant to GPU/ASIC attacks unlike PBKDF2.
 
 ---
 
@@ -54,9 +57,11 @@ By default, `gun.user().create()` works like this:
 |--------|---------|
 | **Offline-First** | Full authentication without network access |
 | **Censorship Resistant** | No central salt storage = no censorship point |
-| **Strong KDF** | PBKDF2 with **300,000 iterations** (computationally expensive to brute-force) |
+| **Memory-Hard KDF** | Argon2id with **64 MB memory** (resistant to GPU/ASIC attacks) |
+| **Domain Separation** | HKDF ensures signing and encryption keys are cryptographically independent |
 | **Standard Cryptography** | ECDSA/ECDH P-256 (NIST curves), SHA-256, AES-GCM |
-| **Audited Libraries** | Uses `@noble/curves` by Paul Miller (widely audited) |
+| **Audited Libraries** | Uses `@noble/curves`, `@noble/hashes`, `hash-wasm` |
+| **Password Validation** | Built-in strength checking (can be disabled) |
 | **Deterministic Recovery** | Can regenerate identity on any device with just username/password |
 
 ### ⚠️ Weaknesses & Risks
@@ -64,28 +69,62 @@ By default, `gun.user().create()` works like this:
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | **No Password Reset** | 🔴 High | Cannot be mitigated - by design |
-| **Rainbow Table Attacks** | 🟡 Medium | 300k PBKDF2 iterations make precomputation expensive |
-| **Weak Password Vulnerability** | 🟡 Medium | Enforce strong passwords in your application |
+| **Weak Password Vulnerability** | 🟡 Medium | Built-in password validation |
 | **Password = Identity** | 🟡 Medium | Educate users: losing password = losing identity forever |
 
 ### Cryptographic Details
 
-```javascript
-// Key Derivation Function
-PBKDF2-HMAC-SHA256
-  - Iterations: 300,000 (high cost factor)
-  - Output: 256 bits
-
-// Signing Keys (for data signatures)
-ECDSA P-256 (secp256r1)
-  - NIST standard curve
-  - 128-bit security level
-
-// Encryption Keys (for private data)
-ECDH P-256 + AES-256-GCM
-  - Authenticated encryption
-  - Forward secrecy capable
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                    KEY DERIVATION FLOW                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Password + Username                                        │
+│         │                                                   │
+│         ▼                                                   │
+│  ┌─────────────────────────────────────────────┐           │
+│  │              ARGON2ID                        │           │
+│  │  - Memory:      64 MB (memory-hard)         │           │
+│  │  - Iterations:  3                            │           │
+│  │  - Parallelism: 4 threads                    │           │
+│  │  - Output:      256 bits                     │           │
+│  └─────────────────────────────────────────────┘           │
+│         │                                                   │
+│         ▼                                                   │
+│     Master Key (256 bits)                                   │
+│         │                                                   │
+│    ┌────┴────┐                                             │
+│    ▼         ▼                                             │
+│  ┌─────┐  ┌─────┐                                          │
+│  │HKDF │  │HKDF │   (Domain Separation)                    │
+│  │sign │  │enc  │                                          │
+│  └─────┘  └─────┘                                          │
+│    │         │                                              │
+│    ▼         ▼                                              │
+│  Signing   Encryption                                       │
+│  Private   Private                                          │
+│  Key       Key                                              │
+│    │         │                                              │
+│    ▼         ▼                                              │
+│  ┌─────────────────┐                                       │
+│  │    P-256 ECDSA  │  (NIST standard curve)                │
+│  │    P-256 ECDH   │  (128-bit security level)             │
+│  └─────────────────┘                                       │
+│         │                                                   │
+│         ▼                                                   │
+│  SEA Pair { pub, priv, epub, epriv }                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Why Argon2id over PBKDF2?
+
+| Aspect | PBKDF2 (v1) | Argon2id (v2) |
+|--------|-------------|---------------|
+| **GPU Resistance** | ❌ Weak | ✅ Strong (memory-hard) |
+| **ASIC Resistance** | ❌ Weak | ✅ Strong |
+| **Memory Usage** | ~0 MB | 64 MB |
+| **Modern Standard** | ❌ 2000 | ✅ 2015 (PHC winner) |
 
 ---
 
@@ -95,13 +134,13 @@ ECDH P-256 + AES-256-GCM
 > **NO PASSWORD RECOVERY**: If you forget your password, your identity is **permanently lost**. There is no "forgot password" feature. This is a fundamental property of deterministic key derivation, not a bug.
 
 > [!WARNING]
-> **PASSWORD STRENGTH IS CRITICAL**: Since there is no random salt protecting against rainbow tables, weak passwords like `123456` or `password` are extremely vulnerable. Enforce minimum password requirements in your application.
+> **BREAKING CHANGE v2**: This version uses Argon2id instead of PBKDF2. Users from v1 cannot login with the same credentials - they will get a different key pair.
 
 > [!WARNING]
-> **PASSWORD CHANGE = NEW IDENTITY**: Changing your password creates a completely different public key. You would need to migrate all your data to a new user identity.
+> **PASSWORD STRENGTH IS CRITICAL**: Built-in validation requires minimum 8 characters with reasonable entropy. You can disable this with `opt.skipValidation = true` but this is not recommended.
 
 > [!IMPORTANT]
-> **This is NOT a drop-in replacement for all use cases.** Standard Gun auth with random salt is still more appropriate for consumer applications where users expect password reset functionality.
+> **PASSWORD CHANGE = NEW IDENTITY**: Changing your password creates a completely different public key. You would need to migrate all your data to a new user identity.
 
 ---
 
@@ -140,7 +179,7 @@ Configure an **importmap** to resolve the `gun` module specifier:
         peers: ['https://your-relay.com/gun']
     });
     
-    gun.user().auth("username", "strong-password-here", (ack) => {
+    gun.user().auth("username", "MyStr0ng!Password#2024", (ack) => {
         if (ack.err) {
             console.error("Auth failed:", ack.err);
             return;
@@ -156,21 +195,19 @@ Configure an **importmap** to resolve the `gun` module specifier:
 
 ## 🚀 Usage
 
-`gun-authd` extends GunDB's native `gun.user().auth()` method to support deterministic authentication. You can use the standard GunDB API directly, or use the convenience method `.authd()`.
+`gun-authd` extends GunDB's native `gun.user().auth()` method to support deterministic authentication.
 
-### Method 1: Using `gun.user().auth()` (Recommended)
-
-After importing `gun-authd`, the native `gun.user().auth()` method automatically supports deterministic authentication when called with username and password:
+### Basic Usage
 
 ```javascript
 import Gun from "gun";
 import "gun/sea";
-import "gun-authd"; // Import the extension
+import "gun-authd"; // Import the extension - auto-mounts to Gun
 
 const gun = Gun();
 
 const username = "alice";
-const password = "correct-horse-battery-staple"; // Use strong passwords!
+const password = "correct-horse-battery-staple!"; // Use strong passwords!
 
 // Use the standard GunDB API - now with deterministic auth!
 gun.user().auth(username, password, (ack) => {
@@ -189,50 +226,207 @@ gun.user().auth(username, password, (ack) => {
 });
 ```
 
-**Note:** If you pass a complete SEA pair (with `priv` and `epriv`), `gun.user().auth()` will use the original GunDB authentication method, maintaining full compatibility.
+### Debug Mode
 
-### Method 2: Using `gun.authd()` (Legacy/Convenience)
-
-For backward compatibility, you can also use the `.authd()` convenience method:
+Enable debug logging to see what's happening:
 
 ```javascript
-// usage: gun.authd(username, password, callback)
+// Option 1: Via auth options
+gun.user().auth(username, password, callback, { debug: true });
+
+// Option 2: Via Gun.authd namespace
+Gun.authd.enableDebug(true);
+gun.user().auth(username, password, callback);
+
+// Option 3: Via ES module import
+import { enableDebug } from "gun-authd";
+enableDebug(true);
+```
+
+### Verify Password (Without Full Auth)
+
+Useful for UI validation before committing to auth:
+
+```javascript
+// Check if password matches stored public key
+const isValid = await gun.verifyPassword(storedPub, "alice", "password!");
+
+if (isValid) {
+    // Proceed with auth
+    gun.user().auth("alice", "password!", callback);
+} else {
+    console.error("Wrong password");
+}
+```
+
+### Disable Password Validation
+
+If you want to handle password validation yourself:
+
+```javascript
+gun.user().auth(username, password, callback, { skipValidation: true });
+```
+
+### Using Legacy `.authd()` Method
+
+For backward compatibility:
+
+```javascript
 gun.authd(username, password, (ack) => {
     if (ack.err) {
         console.error("Authentication failed:", ack.err);
         return;
     }
-
-    // Success!
     console.log("Logged in as:", ack.alias);
-    console.log("SEA Pair:", ack.sea);
 });
 ```
 
 ---
 
+## 📚 API Reference
+
+### Gun Chain Methods (Auto-mounted)
+
+| Method | Description |
+|--------|-------------|
+| `gun.user().auth(username, password, cb, opt)` | Deterministic authentication (overrides standard) |
+| `gun.authd(username, password, cb, opt)` | Legacy convenience method |
+| `gun.verifyPassword(pub, username, password)` | Verify password without full auth |
+
+### Auth Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `skipValidation` | boolean | `false` | Skip password strength validation |
+| `debug` | boolean | `false` | Enable debug logging |
+| `remember` | boolean | `false` | Store pair in sessionStorage |
+
+### Gun.authd Namespace
+
+Access utilities directly via `Gun.authd`:
+
+```javascript
+console.log(Gun.authd.version);  // "2.0.0"
+console.log(Gun.authd.config);   // Argon2 configuration
+
+// Generate pair directly
+const pair = await Gun.authd.generatePair("alice", "password!");
+
+// Validate password strength
+try {
+    Gun.authd.validatePassword("weak");
+} catch (e) {
+    console.error(e.message); // "Password must be at least 8 characters"
+}
+
+// Verify password
+const isValid = await Gun.authd.verifyPassword(storedPub, "alice", "password!");
+
+// Enable debug
+Gun.authd.enableDebug(true);
+```
+
+### ES Module Exports
+
+```javascript
+import { 
+    generateDeterministicPair,
+    validatePasswordStrength,
+    verifyPassword,
+    enableDebug,
+    ARGON2_CONFIG,
+    GunAuthd  // default export with all utilities
+} from "gun-authd";
+
+// Generate pair programmatically
+const pair = await generateDeterministicPair("alice", "password!");
+console.log(pair.pub);  // Public key
+console.log(pair.priv); // Private key (keep secret!)
+```
+
+---
+
+## 📘 TypeScript Support
+
+Full TypeScript support is included:
+
+```typescript
+import Gun from "gun";
+import "gun-authd";
+import type { SEAPair } from "gun-authd";
+
+const gun = Gun();
+
+// Types are inferred
+gun.user().auth("alice", "password!", (ack) => {
+    if (ack.err) return;
+    const pair: SEAPair = ack.sea;
+    console.log(pair.pub);
+});
+
+// Direct import with types
+import { generateDeterministicPair, ARGON2_CONFIG } from "gun-authd";
+
+const pair: SEAPair = await generateDeterministicPair("alice", "password!");
+console.log(ARGON2_CONFIG.memorySize); // 65536 (64 MB)
+```
+
+---
+
+## 🧪 Testing
+
+Run the unit tests:
+
+```bash
+npm test
+```
+
+Tests cover:
+- ✅ Determinism (same input = same output)
+- ✅ Uniqueness (different input = different output)
+- ✅ Key format validation
+- ✅ Domain separation (signing ≠ encryption keys)
+- ✅ Password verification
+- ✅ String normalization (whitespace, unicode NFC)
+
+---
+
 ## ⚙️ How it works (Under the Hood)
 
-### 1. Entropy Generation
+### 1. Argon2id Key Derivation
 
-Takes the `username` and `password`, normalizes them (NFC, trimmed), and runs them through **PBKDF2-HMAC-SHA256** with **300,000 iterations**.
+Takes the `password` and derives a master key using Argon2id:
 
+```javascript
+const ARGON2_CONFIG = {
+  parallelism: 4,      // 4 parallel threads
+  iterations: 3,       // Time cost
+  memorySize: 65536,   // 64 MB memory
+  hashLength: 32,      // 256-bit output
+};
 ```
-Input:  password || username (concatenated bytes)
-Salt:   "signing-v1" or "encryption-v1" (domain separation)
-Output: 256-bit deterministic entropy
+
+### 2. HKDF Domain Separation
+
+The master key is expanded using HKDF to derive separate keys:
+
+```javascript
+signingKey    = HKDF(masterKey, "signing-key")
+encryptionKey = HKDF(masterKey, "encryption-key")
 ```
 
-### 2. Key Derivation
+This ensures that even if one key is compromised, the other remains secure.
 
-The resulting entropy is used as a private key seed:
+### 3. P-256 Key Generation
+
+The derived keys are used as private key scalars for P-256 curves:
 
 | Key Type | Algorithm | Purpose |
 |----------|-----------|---------|
 | **Sign Keys** | ECDSA P-256 | Signing data, proving identity |
 | **Encrypt Keys** | ECDH P-256 | Deriving shared secrets for encryption |
 
-### 3. Graph Registration
+### 4. Graph Registration
 
 When you call `gun.user().auth()`:
 
@@ -240,19 +434,33 @@ When you call `gun.user().auth()`:
 2. User node is populated with `pub` and `epub` keys
 3. Other users can now discover you and send encrypted messages
 
-All of this happens transparently - you just use `gun.user().auth()` as you normally would!
+---
+
+## ⏱️ Performance
+
+Approximate key derivation times:
+
+| Device | Time |
+|--------|------|
+| Desktop (8GB+ RAM) | ~200-400ms |
+| Laptop (4GB RAM) | ~400-600ms |
+| Mobile (modern) | ~500-800ms |
+| Low-end device | ~1-2s |
+
+The majority of time is spent in Argon2id (intentionally slow for security).
 
 ---
 
 ## ⚠️ Important Trade-offs
 
-| Standard Gun Auth | gun-authd |
-|-------------------|-----------|
-| ✅ Random salt protects weak passwords | ❌ No salt = weak passwords more vulnerable |
+| Standard Gun Auth | gun-authd v2 |
+|-------------------|--------------|
+| ✅ Random salt protects weak passwords | ⚠️ Built-in validation, but no salt |
 | ✅ Password can be changed | ❌ Password change = new identity |
 | ❌ Requires network to login | ✅ Fully offline login |
 | ❌ Salt can be censored | ✅ No censorship point |
 | ❌ Salt loss = identity loss | ✅ Identity always recoverable |
+| ❌ PBKDF2 vulnerable to GPU | ✅ Argon2id memory-hard |
 
 ---
 
@@ -278,16 +486,28 @@ All of this happens transparently - you just use `gun.user().auth()` as you norm
 
 ## 🛠 Dependencies
 
-This project relies on the robust cryptography libraries from [Paul Miller](https://github.com/paulmillr):
-
-* [`@noble/curves`](https://github.com/paulmillr/noble-curves) - P-256 elliptic curve operations
-* [`@noble/hashes`](https://github.com/paulmillr/noble-hashes) - SHA-256, HMAC (used internally)
+| Package | Purpose |
+|---------|---------|
+| [`@noble/curves`](https://github.com/paulmillr/noble-curves) | P-256 elliptic curve operations |
+| [`@noble/hashes`](https://github.com/paulmillr/noble-hashes) | SHA-256, HKDF |
+| [`hash-wasm`](https://github.com/nicoth-in/wasm-hash) | Argon2id (WebAssembly) |
 
 These libraries are:
-- ✅ Audited by multiple security firms
-- ✅ Used in production by major blockchain projects
-- ✅ Zero dependencies themselves
-- ✅ TypeScript native
+- ✅ Audited by security firms
+- ✅ Used in production by major projects
+- ✅ Zero/minimal dependencies
+- ✅ Browser and Node.js compatible
+
+---
+
+## 🔄 Migration from v1
+
+> [!WARNING]
+> v2 uses Argon2id instead of PBKDF2. This is a **breaking change**.
+
+If you have existing v1 users, they will need to create new accounts. The same username/password will generate a **different** key pair in v2.
+
+**There is no migration path** - this is by design, as the whole point of deterministic auth is that the keys are derived purely from the password.
 
 ---
 
@@ -301,7 +521,18 @@ MIT
 
 Issues and PRs welcome! Please ensure any cryptographic changes are well-reasoned and don't reduce the security guarantees.
 
+```bash
+# Run tests
+npm test
+
+# Build
+npm run build
+```
+
+---
+
 ## 📚 Related Projects
 
 - [GunDB](https://github.com/amark/gun) - The decentralized database this extends
 - [SEA](https://gun.eco/docs/SEA) - Security, Encryption, Authorization module for Gun
+- [Argon2](https://github.com/P-H-C/phc-winner-argon2) - Password Hashing Competition winner
