@@ -1,10 +1,20 @@
 {
     "name": "gun-authd",
-    "version": "2.0.2",
+    "version": "2.0.4",
     "description": "Deterministic authentication for GunDB using Argon2id + HKDF. Offline-first, censorship-resistant login.",
     "main": "./dist/gun-authd.min.js",
     "types": "./gun-authd.d.ts",
     "type": "module",
+    "exports": {
+        ".": {
+            "import": "./dist/gun-authd.min.js",
+            "default": "./dist/gun-authd.min.js"
+        }
+    },
+    "files": [
+        "dist",
+        "src"
+    ],
     "scripts": {
         "build": "esbuild ./src/gun-authd.js --bundle --minify --outfile=./dist/gun-authd.min.js --format=esm --external:gun",
         "test": "node test/unit.test.js"
