@@ -1,6 +1,6 @@
 {
     "name": "gun-authd",
-    "version": "2.0.1",
+    "version": "2.0.2",
     "description": "Deterministic authentication for GunDB using Argon2id + HKDF. Offline-first, censorship-resistant login.",
     "main": "./dist/gun-authd.min.js",
     "types": "./gun-authd.d.ts",
