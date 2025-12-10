@@ -111,34 +111,3 @@ declare module 'gun-authd' {
     export default GunAuthd;
 }
 
-// Augment Gun types
-declare module 'gun' {
-    interface IGunChain<TNode> {
-        /**
-         * Legacy convenience method for deterministic auth
-         * @deprecated Use gun.user().auth() instead
-         */
-        authd(
-            username: string,
-            password: string,
-            callback?: (ack: { err?: string; pub?: string; sea?: any }) => void,
-            options?: { skipValidation?: boolean; debug?: boolean }
-        ): IGunChain<TNode>;
-
-        /**
-         * Verify if a password matches an expected public key
-         */
-        verifyPassword(
-            expectedPub: string,
-            username: string,
-            password: string
-        ): Promise<boolean>;
-    }
-
-    interface IGunStatic {
-        /**
-         * GunAuthd utilities namespace
-         */
-        authd: import('gun-authd').GunAuthdNamespace;
-    }
-}

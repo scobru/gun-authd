@@ -9,7 +9,7 @@ try {
 
 const gun = Gun({"peers": ["https://shogun-relay.scobrudot.dev/gun"], radisk: false});
     
-const user = "scobru";
+const user = "bimbominchia";
 const pass = "francos88";
 
 // Aspetta un momento per assicurarsi che l'override sia stato applicato
