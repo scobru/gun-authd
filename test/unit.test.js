@@ -1,4 +1,5 @@
-import { generateDeterministicPair, verifyPassword, enableDebug } from '../src/gun-authd.js';
+import { generateDeterministicPair, verifyPassword, checkAliasExists, enableDebug } from '../src/gun-authd.js';
+import Gun from 'gun';
 
 /**
  * Unit tests for gun-authd
@@ -104,6 +105,23 @@ async function runTests() {
   
   const pairEmpty = await generateDeterministicPair("", "password!");
   assert(typeof pairEmpty.pub === 'string', "Empty username still produces valid pair");
+
+  // Test 9: Check alias exists function
+  console.log('\n📋 Test: Check Alias Exists\n');
+  
+  // Test with invalid inputs
+  const invalidResult1 = await checkAliasExists(null, "", 100);
+  assert(invalidResult1.exists === false, "Empty alias returns exists=false");
+  assert(invalidResult1.pub === null, "Empty alias returns pub=null");
+  
+  const invalidResult2 = await checkAliasExists(null, null, 100);
+  assert(invalidResult2.exists === false, "Null alias returns exists=false");
+  
+  // Test with non-existent alias (should timeout and return false)
+  const gunInstance = Gun({ radisk: false });
+  const nonExistentResult = await checkAliasExists(gunInstance, "nonexistent_user_12345", 500);
+  assert(nonExistentResult.exists === false, "Non-existent alias returns exists=false");
+  assert(nonExistentResult.pub === null, "Non-existent alias returns pub=null");
 
   // Print results
   console.log('\n' + '='.repeat(50));

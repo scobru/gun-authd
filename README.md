@@ -1,10 +1,10 @@
-# gun-authd v2: Deterministic Authentication for GunDB
+# gun-authd v3: Deterministic Authentication for GunDB
 
 **gun-authd** is a specialized extension for [GunDB](https://gun.eco/) that enables purely deterministic user authentication using **Argon2id** and **HKDF**.
 
-It allows users to generate their SEA (Security, Encryption, Authorization) key pairs locally based solely on their username and password, **without needing to fetch a random salt from the network**.
+It allows users to generate their SEA (Security, Encryption, Authorization) key pairs locally based solely on their username, password, and optional **PIN**, **without needing to fetch a random salt from the network**.
 
-> 🚀 **Why this matters:** This enables true **offline-first login** on new devices. If you know your username and password, you can recover your identity instantly, even if the relay node holding your metadata is down or unreachable.
+> 🚀 **What's new in v3:** Optional **PIN support** (4-8 digits) for three-factor key derivation, **rate limiting** to prevent brute-force attacks, **stricter password validation** (12 chars, 40 bits entropy), and **secure memory wipe** for better security.
 
 ---
 
@@ -43,10 +43,13 @@ By default, `gun.user().create()` works like this:
 **gun-authd** removes the random salt. Instead, it uses **Argon2id + HKDF** to mathematically derive your keys.
 
 * **Zero Lookup:** Login is instant. No network request needed to "find" the user first.
-* **Deterministic:** `Username` + `Password` will *always* generate the exact same Private Key.
+* **Deterministic:** `Username` + `Password` (+ optional `PIN`) will *always* generate the exact same Private Key.
+* **Three-Factor Support:** Optional PIN (4-8 digits) adds a third factor to key derivation.
+* **Rate Limiting:** Built-in protection against brute-force attacks (5 attempts, progressive delay).
 * **Graph Compatible:** It manually handles the `~@alias` -> `~pubkey` linking, so your user is still discoverable by others in the Gun network.
 * **Memory-Hard:** Argon2id is resistant to GPU/ASIC attacks unlike PBKDF2.
-* **Username Protection:** Automatically prevents login if username already exists with a different password, protecting existing accounts from unauthorized access attempts.
+* **Secure Memory Wipe:** Sensitive key material is securely cleared after use.
+* **Username Protection:** Automatically prevents login if username already exists with a different password.
 
 ---
 
@@ -62,9 +65,11 @@ By default, `gun.user().create()` works like this:
 | **Domain Separation** | HKDF ensures signing and encryption keys are cryptographically independent |
 | **Standard Cryptography** | ECDSA/ECDH P-256 (NIST curves), SHA-256, AES-GCM |
 | **Audited Libraries** | Uses `@noble/curves`, `@noble/hashes`, `hash-wasm` |
-| **Password Validation** | Built-in strength checking (can be disabled) |
-| **Deterministic Recovery** | Can regenerate identity on any device with just username/password |
-| **Username Protection** | Prevents login if username exists with different password, protecting accounts from unauthorized access |
+| **Password Validation** | Stricter requirements: 12 chars, 40 bits entropy, blocks common passwords |
+| **PIN Support** | Optional 4-8 digit PIN as third factor for key derivation |
+| **Rate Limiting** | 5 attempts max, progressive delay (30s-5min) |
+| **Secure Memory Wipe** | Sensitive buffers cleared after use |
+| **Deterministic Recovery** | Can regenerate identity on any device with username/password/PIN |
 
 ### ⚠️ Weaknesses & Risks
 
@@ -87,7 +92,7 @@ By default, `gun.user().create()` works like this:
 │  ┌─────────────────────────────────────────────┐           │
 │  │              ARGON2ID                        │           │
 │  │  - Memory:      64 MB (memory-hard)         │           │
-│  │  - Iterations:  3                            │           │
+│  │  - Iterations:  4                            │           │
 │  │  - Parallelism: 4 threads                    │           │
 │  │  - Output:      256 bits                     │           │
 │  └─────────────────────────────────────────────┘           │
@@ -136,10 +141,13 @@ By default, `gun.user().create()` works like this:
 > **NO PASSWORD RECOVERY**: If you forget your password, your identity is **permanently lost**. There is no "forgot password" feature. This is a fundamental property of deterministic key derivation, not a bug.
 
 > [!WARNING]
-> **BREAKING CHANGE v2**: This version uses Argon2id instead of PBKDF2. Users from v1 cannot login with the same credentials - they will get a different key pair.
+> **BREAKING CHANGE v3**: This version uses different salt format than v2. Users from v2 cannot login with the same credentials - they will get a different key pair.
 
 > [!WARNING]
-> **PASSWORD STRENGTH IS CRITICAL**: Built-in validation requires minimum 8 characters with reasonable entropy. You can disable this with `opt.skipValidation = true` but this is not recommended.
+> **PASSWORD STRENGTH IS CRITICAL**: Built-in validation requires minimum **12 characters** with 40 bits entropy. It also blocks common passwords and repetitive patterns. Disable with `opt.skipValidation = true` (not recommended).
+
+> [!TIP]
+> **NEW: PIN SUPPORT**: Add an optional PIN (4-8 digits) for stronger security: `gun.user().auth(user, pass, cb, { pin: "1234" })`
 
 > [!IMPORTANT]
 > **PASSWORD CHANGE = NEW IDENTITY**: Changing your password creates a completely different public key. You would need to migrate all your data to a new user identity.
@@ -228,6 +236,27 @@ gun.user().auth(username, password, (ack) => {
 });
 ```
 
+### Authentication with PIN (v3 Feature)
+
+Add a PIN for three-factor key derivation:
+
+```javascript
+// With optional PIN (4-8 digits)
+gun.user().auth(username, password, (ack) => {
+    if (ack.err) {
+        console.error("Auth failed:", ack.err);
+        return;
+    }
+    console.log("Logged in with PIN!", ack.alias);
+}, { pin: "1234" });
+
+// The same username/password WITHOUT the PIN creates a DIFFERENT identity!
+// This is by design - the PIN is part of the key derivation.
+```
+
+> ⚠️ **Important:** If a user authenticates with a PIN, they MUST use the same PIN every time. Different PIN = different identity.
+```
+
 ### Debug Mode
 
 Enable debug logging to see what's happening:
@@ -274,6 +303,9 @@ This prevents:
 - Unauthorized access attempts to existing accounts
 - Accidental account overwrites
 - Security vulnerabilities from weak password reuse
+
+> [!NOTE]
+> **Alias Check Limitation:** The alias collision detection requires either local cache (`radata`) or a responsive relay. On a fresh device with a slow/unresponsive relay, the check may timeout and proceed with registration. For best results, ensure your relay has persistence enabled.
 
 **Example:**
 
@@ -334,7 +366,10 @@ gun.authd(username, password, (ack) => {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `pin` | string | `null` | Optional PIN (4-8 digits) for three-factor auth |
 | `skipValidation` | boolean | `false` | Skip password strength validation |
+| `skipPinValidation` | boolean | `false` | Skip PIN format validation |
+| `skipRateLimit` | boolean | `false` | Skip rate limiting check |
 | `debug` | boolean | `false` | Enable debug logging |
 | `remember` | boolean | `false` | Store pair in sessionStorage |
 
@@ -343,21 +378,38 @@ gun.authd(username, password, (ack) => {
 Access utilities directly via `Gun.authd`:
 
 ```javascript
-console.log(Gun.authd.version);  // "2.0.0"
-console.log(Gun.authd.config);   // Argon2 configuration
+console.log(Gun.authd.version);  // "3.0.0"
+console.log(Gun.authd.config);   // { argon2, password, pin, rateLimit }
 
-// Generate pair directly
-const pair = await Gun.authd.generatePair("alice", "password!");
+// Generate pair directly (with optional PIN)
+const pair = await Gun.authd.generatePair("alice", "strongPassword!");
+const pairWithPin = await Gun.authd.generatePair("alice", "strongPassword!", "1234");
 
 // Validate password strength
 try {
     Gun.authd.validatePassword("weak");
 } catch (e) {
-    console.error(e.message); // "Password must be at least 8 characters"
+    console.error(e.message); // "Password must be at least 12 characters"
 }
 
-// Verify password
-const isValid = await Gun.authd.verifyPassword(storedPub, "alice", "password!");
+// Validate PIN format
+try {
+    Gun.authd.validatePin("1234"); // OK
+    Gun.authd.validatePin("0000"); // Throws - too simple
+} catch (e) {
+    console.error(e.message);
+}
+
+// Check/reset rate limit
+try {
+    Gun.authd.checkRateLimit("alice");
+} catch (e) {
+    console.error(e.message); // "Too many attempts..."
+}
+Gun.authd.resetRateLimit("alice"); // Clear on success
+
+// Verify password with optional PIN
+const isValid = await Gun.authd.verifyPassword(storedPub, "alice", "password!", "1234");
 
 // Enable debug
 Gun.authd.enableDebug(true);
@@ -369,14 +421,22 @@ Gun.authd.enableDebug(true);
 import { 
     generateDeterministicPair,
     validatePasswordStrength,
+    validatePin,
     verifyPassword,
+    checkRateLimit,
+    resetRateLimit,
     enableDebug,
+    secureWipe,
     ARGON2_CONFIG,
+    PASSWORD_CONFIG,
+    PIN_CONFIG,
+    RATE_LIMIT_CONFIG,
     GunAuthd  // default export with all utilities
 } from "gun-authd";
 
-// Generate pair programmatically
-const pair = await generateDeterministicPair("alice", "password!");
+// Generate pair programmatically (with optional PIN)
+const pair = await generateDeterministicPair("alice", "strongPassword123!");
+const pairWithPin = await generateDeterministicPair("alice", "strongPassword123!", "1234");
 console.log(pair.pub);  // Public key
 console.log(pair.priv); // Private key (keep secret!)
 ```
@@ -437,9 +497,27 @@ Takes the `password` and derives a master key using Argon2id:
 ```javascript
 const ARGON2_CONFIG = {
   parallelism: 4,      // 4 parallel threads
-  iterations: 3,       // Time cost
+  iterations: 4,       // Time cost (increased in v3)
   memorySize: 65536,   // 64 MB memory
   hashLength: 32,      // 256-bit output
+};
+
+const PASSWORD_CONFIG = {
+  minLength: 12,       // Minimum password length
+  minEntropy: 40,      // Minimum entropy bits
+};
+
+const PIN_CONFIG = {
+  minLength: 4,
+  maxLength: 8,
+  pattern: /^\d+$/,    // Digits only
+};
+
+const RATE_LIMIT_CONFIG = {
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  baseDelayMs: 30 * 1000,   // 30 seconds
+  maxDelayMs: 5 * 60 * 1000,// 5 minutes
 };
 ```
 
@@ -505,14 +583,15 @@ The majority of time is spent in Argon2id (intentionally slow for security).
 
 ## ⚠️ Important Trade-offs
 
-| Standard Gun Auth | gun-authd v2 |
+| Standard Gun Auth | gun-authd v3 |
 |-------------------|--------------|
-| ✅ Random salt protects weak passwords | ⚠️ Built-in validation, but no salt |
-| ✅ Password can be changed | ❌ Password change = new identity |
+| ✅ Random salt protects weak passwords | ⚠️ Stricter validation + optional PIN |
+| ✅ Password can be changed | ❌ Password/PIN change = new identity |
 | ❌ Requires network to login | ✅ Fully offline login |
 | ❌ Salt can be censored | ✅ No censorship point |
 | ❌ Salt loss = identity loss | ✅ Identity always recoverable |
 | ❌ PBKDF2 vulnerable to GPU | ✅ Argon2id memory-hard |
+| ❌ No brute-force protection | ✅ Rate limiting built-in |
 
 ---
 
@@ -552,14 +631,20 @@ These libraries are:
 
 ---
 
-## 🔄 Migration from v1
+## 🔄 Migration
+
+### From v2 to v3
 
 > [!WARNING]
-> v2 uses Argon2id instead of PBKDF2. This is a **breaking change**.
+> v3 uses a different salt format. This is a **breaking change**.
 
-If you have existing v1 users, they will need to create new accounts. The same username/password will generate a **different** key pair in v2.
+If you have existing v2 users, they will need to create new accounts. The same username/password will generate a **different** key pair in v3.
 
-**There is no migration path** - this is by design, as the whole point of deterministic auth is that the keys are derived purely from the password.
+**There is no migration path** - this is by design, as the whole point of deterministic auth is that the keys are derived purely from the credentials.
+
+### From v1 to v3
+
+Same as above - v1 users will need new accounts.
 
 ---
 

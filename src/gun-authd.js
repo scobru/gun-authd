@@ -8,13 +8,43 @@ import { argon2id } from "hash-wasm";
 // --- CONFIGURATION ---
 const ARGON2_CONFIG = {
   parallelism: 4,      // Number of parallel threads
-  iterations: 3,       // Time cost (higher = slower but more secure)
+  iterations: 4,       // Time cost (higher = slower but more secure) - increased from 3
   memorySize: 65536,   // Memory in KB (64 MB) - memory-hard protection
   hashLength: 32,      // Output 256 bits
 };
 
-const KEY_VERSION = "v2"; // Version identifier for key derivation
-const LIB_VERSION = "2.0.0";
+const KEY_VERSION = "v3"; // Version identifier for key derivation (v3 = with PIN support)
+const LIB_VERSION = "3.0.0";
+
+// Password validation config
+const PASSWORD_CONFIG = {
+  minLength: 12,       // Minimum password length (increased from 8)
+  minEntropy: 40,      // Minimum entropy bits (increased from 28)
+};
+
+// PIN validation config  
+const PIN_CONFIG = {
+  minLength: 4,
+  maxLength: 8,
+  pattern: /^\d+$/,    // Only digits allowed
+};
+
+// Rate limiting config
+const RATE_LIMIT_CONFIG = {
+  maxAttempts: 5,           // Max attempts before lockout
+  windowMs: 15 * 60 * 1000, // 15 minute window
+  baseDelayMs: 30 * 1000,   // 30 second base delay
+  maxDelayMs: 5 * 60 * 1000,// 5 minute max delay
+};
+
+// Common passwords to block (lowercase)
+const COMMON_PASSWORDS = new Set([
+  'password123', 'password1234', '12345678', '123456789', '1234567890',
+  'qwerty1234', 'qwertyuiop', 'letmein123', 'welcome123', 'monkey1234',
+  'dragon1234', 'master1234', 'iloveyou12', 'trustno123', 'sunshine12',
+  'princess12', 'football12', 'baseball12', 'shadow1234', 'michael123',
+  'password!1', 'passw0rd12', 'p@ssword12', 'admin12345', 'root123456',
+]);
 
 // --- HELPERS ---
 const TEXT_ENCODER = new TextEncoder();
@@ -101,72 +131,124 @@ function hkdfExpand(ikm, info, length = 32) {
   return hkdf(sha256, ikm, salt, info, length);
 }
 
+// --- SECURE MEMORY WIPE ---
+
+/**
+ * Securely wipes a buffer by overwriting with random data then zeros
+ * Helps prevent memory side-channel attacks
+ * @param {Uint8Array} buffer - Buffer to wipe
+ */
+function secureWipe(buffer) {
+  if (buffer instanceof Uint8Array && buffer.length > 0) {
+    try {
+      // First pass: overwrite with random data
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        crypto.getRandomValues(buffer);
+      }
+      // Second pass: fill with zeros
+      buffer.fill(0);
+    } catch (e) {
+      // Fallback: just fill with zeros
+      buffer.fill(0);
+    }
+  }
+}
+
 // --- KEY GENERATION ---
 
 /**
- * Generates a deterministic SEA key pair from username and password
+ * Generates a deterministic SEA key pair from username, password, and optional PIN
  * @param {string} username - The username
  * @param {string} password - The password
+ * @param {string|null} pin - Optional PIN (4-8 digits) for additional security
  * @returns {Promise<{pub: string, priv: string, epub: string, epriv: string}>}
  */
-async function generateDeterministicPair(username, password) {
-  debugLog("Generating pair for:", username);
+async function generateDeterministicPair(username, password, pin = null) {
+  debugLog("Generating pair for:", username, pin ? "(with PIN)" : "(no PIN)");
   
   const normalizedUser = normalizeString(username);
   const normalizedPass = normalizeString(password);
+  const normalizedPin = pin ? normalizeString(pin) : "";
   
   // Combine password and username for Argon2 input
   const passwordBytes = TEXT_ENCODER.encode(normalizedPass);
-  const usernameBytes = TEXT_ENCODER.encode(normalizedUser);
   
-  // Use username as salt for Argon2 (deterministic)
-  const argonSalt = TEXT_ENCODER.encode(`gun-authd-salt-${normalizedUser}`);
+  // Build salt: include PIN if provided (this makes keys unique per PIN)
+  // Format: gun-authd-v3-salt-{username}[-pin-{pin}]
+  const saltSuffix = normalizedPin ? `-pin-${normalizedPin}` : "";
+  const argonSalt = TEXT_ENCODER.encode(`gun-authd-${KEY_VERSION}-salt-${normalizedUser}${saltSuffix}`);
   
-  // Derive master key using Argon2id (memory-hard)
-  const masterKey = await argon2Derive(passwordBytes, argonSalt);
+  // Track buffers for secure cleanup
+  let masterKey = null;
+  let signingPrivateKey = null;
+  let encryptionPrivateKey = null;
   
-  // Use HKDF to derive separate keys for signing and encryption
-  const signingInfo = TEXT_ENCODER.encode("signing-key");
-  const encryptionInfo = TEXT_ENCODER.encode("encryption-key");
-  
-  const signingPrivateKey = hkdfExpand(masterKey, signingInfo, 32);
-  const encryptionPrivateKey = hkdfExpand(masterKey, encryptionInfo, 32);
-  
-  // Generate P-256 public keys from private keys
-  const signingPublicKey = p256.getPublicKey(signingPrivateKey, false);
-  const encryptionPublicKey = p256.getPublicKey(encryptionPrivateKey, false);
-  
-  const pair = {
-    pub: keyBufferToJwk(signingPublicKey),
-    priv: arrayBufToBase64UrlEncode(signingPrivateKey),
-    epub: keyBufferToJwk(encryptionPublicKey),
-    epriv: arrayBufToBase64UrlEncode(encryptionPrivateKey),
-  };
-  
-  debugLog("Generated pub:", pair.pub.slice(0, 20) + "...");
-  return pair;
+  try {
+    // Derive master key using Argon2id (memory-hard)
+    masterKey = await argon2Derive(passwordBytes, argonSalt);
+    
+    // Use HKDF to derive separate keys for signing and encryption
+    const signingInfo = TEXT_ENCODER.encode("signing-key");
+    const encryptionInfo = TEXT_ENCODER.encode("encryption-key");
+    
+    signingPrivateKey = hkdfExpand(masterKey, signingInfo, 32);
+    encryptionPrivateKey = hkdfExpand(masterKey, encryptionInfo, 32);
+    
+    // Generate P-256 public keys from private keys
+    const signingPublicKey = p256.getPublicKey(signingPrivateKey, false);
+    const encryptionPublicKey = p256.getPublicKey(encryptionPrivateKey, false);
+    
+    const pair = {
+      pub: keyBufferToJwk(signingPublicKey),
+      priv: arrayBufToBase64UrlEncode(signingPrivateKey),
+      epub: keyBufferToJwk(encryptionPublicKey),
+      epriv: arrayBufToBase64UrlEncode(encryptionPrivateKey),
+    };
+    
+    debugLog("Generated pub:", pair.pub.slice(0, 20) + "...");
+    return pair;
+  } finally {
+    // Secure cleanup of sensitive key material
+    if (masterKey) secureWipe(masterKey);
+    if (signingPrivateKey) secureWipe(signingPrivateKey);
+    if (encryptionPrivateKey) secureWipe(encryptionPrivateKey);
+  }
 }
 
 // --- PASSWORD VALIDATION ---
 
 /**
- * Validates password strength
+ * Validates password strength with stricter requirements
  * @param {string} password - The password to validate
  * @returns {boolean} - True if valid
  * @throws {Error} - If password is too weak
  */
 function validatePasswordStrength(password) {
-  const minLength = 8;
-  
   if (!password || typeof password !== 'string') {
     throw new Error("Password must be a non-empty string");
   }
   
-  if (password.length < minLength) {
-    throw new Error(`Password must be at least ${minLength} characters`);
+  // Check minimum length
+  if (password.length < PASSWORD_CONFIG.minLength) {
+    throw new Error(`Password must be at least ${PASSWORD_CONFIG.minLength} characters`);
   }
   
-  // Calculate basic entropy estimate
+  // Check for common passwords
+  if (COMMON_PASSWORDS.has(password.toLowerCase())) {
+    throw new Error("This password is too common. Please choose a unique password.");
+  }
+  
+  // Check for repetitive patterns (e.g., "aaaa" or "1111")
+  if (/(.)\1{3,}/.test(password)) {
+    throw new Error("Password contains too many repeated characters.");
+  }
+  
+  // Check for sequential patterns
+  if (/(?:abc|bcd|cde|def|efg|fgh|ghi|hij|ijk|jkl|klm|lmn|mno|nop|opq|pqr|qrs|rst|stu|tuv|uvw|vwx|wxy|xyz|012|123|234|345|456|567|678|789)/i.test(password)) {
+    throw new Error("Password contains sequential characters. Mix it up more.");
+  }
+  
+  // Calculate entropy estimate
   const hasLower = /[a-z]/.test(password);
   const hasUpper = /[A-Z]/.test(password);
   const hasNumber = /[0-9]/.test(password);
@@ -176,24 +258,114 @@ function validatePasswordStrength(password) {
                       (hasNumber ? 10 : 0) + (hasSpecial ? 32 : 0);
   const entropy = password.length * Math.log2(charsetSize || 1);
   
-  if (entropy < 28) { // ~28 bits minimum (very basic threshold)
-    throw new Error("Password is too weak. Use a mix of letters, numbers, and symbols.");
+  if (entropy < PASSWORD_CONFIG.minEntropy) {
+    throw new Error("Password is too weak. Use a longer password with letters, numbers, and symbols.");
   }
   
   return true;
 }
 
 /**
- * Verify if a password matches an expected public key
+ * Validates PIN format
+ * @param {string} pin - The PIN to validate
+ * @returns {boolean} - True if valid
+ * @throws {Error} - If PIN format is invalid
+ */
+function validatePin(pin) {
+  if (!pin || typeof pin !== 'string') {
+    throw new Error("PIN must be a non-empty string");
+  }
+  
+  const trimmedPin = pin.trim();
+  
+  if (trimmedPin.length < PIN_CONFIG.minLength) {
+    throw new Error(`PIN must be at least ${PIN_CONFIG.minLength} digits`);
+  }
+  
+  if (trimmedPin.length > PIN_CONFIG.maxLength) {
+    throw new Error(`PIN must be at most ${PIN_CONFIG.maxLength} digits`);
+  }
+  
+  if (!PIN_CONFIG.pattern.test(trimmedPin)) {
+    throw new Error("PIN must contain only digits (0-9)");
+  }
+  
+  // Block obvious PINs
+  const obviousPins = ['0000', '1111', '2222', '3333', '4444', '5555', '6666', '7777', '8888', '9999',
+                       '1234', '4321', '0123', '9876', '1212', '2020', '1111', '0000'];
+  if (obviousPins.includes(trimmedPin)) {
+    throw new Error("PIN is too simple. Please choose a less obvious PIN.");
+  }
+  
+  return true;
+}
+
+// --- RATE LIMITING ---
+
+const rateLimitStore = new Map(); // { alias: { count, lastAttempt, lockedUntil } }
+
+/**
+ * Checks rate limit for an alias and throws if exceeded
+ * @param {string} alias - The username/alias
+ * @throws {Error} - If rate limit exceeded
+ */
+function checkRateLimit(alias) {
+  const now = Date.now();
+  const record = rateLimitStore.get(alias) || { count: 0, lastAttempt: 0, lockedUntil: 0 };
+  
+  // Check if currently locked
+  if (record.lockedUntil > now) {
+    const waitSeconds = Math.ceil((record.lockedUntil - now) / 1000);
+    throw new Error(`Too many attempts. Please wait ${waitSeconds} seconds before trying again.`);
+  }
+  
+  // Reset if window expired
+  if (now - record.lastAttempt > RATE_LIMIT_CONFIG.windowMs) {
+    record.count = 0;
+    record.lockedUntil = 0;
+  }
+  
+  // Check if exceeded max attempts
+  if (record.count >= RATE_LIMIT_CONFIG.maxAttempts) {
+    // Calculate delay: increases with each lockout
+    const lockoutMultiplier = Math.floor(record.count / RATE_LIMIT_CONFIG.maxAttempts);
+    const delay = Math.min(
+      RATE_LIMIT_CONFIG.baseDelayMs * lockoutMultiplier,
+      RATE_LIMIT_CONFIG.maxDelayMs
+    );
+    record.lockedUntil = now + delay;
+    rateLimitStore.set(alias, record);
+    
+    const waitSeconds = Math.ceil(delay / 1000);
+    throw new Error(`Too many attempts. Please wait ${waitSeconds} seconds before trying again.`);
+  }
+  
+  // Increment attempt counter
+  record.count++;
+  record.lastAttempt = now;
+  rateLimitStore.set(alias, record);
+}
+
+/**
+ * Resets rate limit for an alias (on successful auth)
+ * @param {string} alias - The username/alias
+ */
+function resetRateLimit(alias) {
+  rateLimitStore.delete(alias);
+}
+
+/**
+ * Verify if a password (and optional PIN) matches an expected public key
  * Useful for UI validation without full auth
  * @param {string} expectedPub - The expected public key
  * @param {string} username - The username
  * @param {string} password - The password to verify
+ * @param {string|null} pin - Optional PIN
  * @returns {Promise<boolean>}
  */
-async function verifyPassword(expectedPub, username, password) {
+async function verifyPassword(expectedPub, username, password, pin = null) {
   try {
-    const pair = await generateDeterministicPair(username, password);
+    const pair = await generateDeterministicPair(username, password, pin);
     return pair.pub === expectedPub;
   } catch (e) {
     return false;
@@ -277,7 +449,21 @@ function applyAuthOverride() {
       return originalAuth.call(this, ...args);
     }
     
-    debugLog("Using deterministic auth for:", alias);
+    // Extract PIN from options (new feature)
+    const pin = opt.pin || null;
+    
+    debugLog("Using deterministic auth for:", alias, pin ? "(with PIN)" : "(no PIN)");
+    
+    // Check rate limiting (unless disabled)
+    if (!opt.skipRateLimit) {
+      try {
+        checkRateLimit(alias);
+      } catch (e) {
+        debugLog("Rate limit exceeded:", e.message);
+        if (cb) cb({ err: e.message });
+        return gun;
+      }
+    }
     
     // Check for concurrent calls
     if (cat.ing) {
@@ -298,13 +484,26 @@ function applyAuthOverride() {
       }
     }
     
-    // Generate deterministic pair first, then check if username already exists
-    generateDeterministicPair(alias, pass).then((deterministicPair) => {
-      // Check if username already exists and verify it matches this public key
+    // Validate PIN if provided (optional - can be disabled via opt.skipPinValidation)
+    if (pin && !opt.skipPinValidation) {
+      try {
+        validatePin(pin);
+      } catch (e) {
+        cat.ing = false;
+        debugLog("PIN validation failed:", e.message);
+        if (cb) cb({ err: e.message });
+        return gun;
+      }
+    }
+    
+    // Generate deterministic pair with optional PIN
+    generateDeterministicPair(alias, pass, pin).then((deterministicPair) => {
+      // Check if alias already exists in the network
       const aliasNode = root.get('~@' + alias);
       const userNode = root.get('~' + deterministicPair.pub);
       let checksDone = 0;
-      let existingPub = null;
+      let aliasExists = false;  // Explicit flag: does alias exist in network?
+      let existingPub = null;    // Public key associated with existing alias
       let userNodeHasData = false;
       let checkTimeout = null;
       
@@ -315,51 +514,88 @@ function applyAuthOverride() {
         
         if (checkTimeout) clearTimeout(checkTimeout);
         
-        // If username exists, proceed with auth
-        if (existingPub) {
-          debugLog("Username exists, proceeding with auth");
-          // Username exists - proceed with login (don't write index)
+        // First check: Does the alias exist in the network?
+        if (aliasExists) {
+          // Alias exists - verify if it belongs to this user or another
+          if (existingPub !== deterministicPair.pub) {
+            // Alias exists but belongs to a different user (different credentials)
+            cat.ing = false;
+            const errorMsg = `Alias "${alias}" exists but credentials do not match. The alias may be registered with different credentials or belong to another user.`;
+            debugLog(`Alias "${alias}" exists with pub ${existingPub?.substring(0, 20)}... but generated pub is ${deterministicPair.pub?.substring(0, 20)}...`);
+            if (cb) cb({ err: errorMsg });
+            return;
+          }
+          // Alias exists and belongs to this user - proceed with login
+          debugLog("Alias exists and matches this user, proceeding with auth");
           proceedWithAuth(deterministicPair, existingPub);
         } else if (userNodeHasData) {
-          // User node exists but username index doesn't - user exists, just missing index
-          debugLog("User node exists but index missing, proceeding with auth and writing index");
+          // User node exists but alias index doesn't - user exists, just missing index
+          debugLog("User node exists but alias index missing, proceeding with auth and writing index");
           proceedWithAuth(deterministicPair, null); // Pass null to write index
         } else {
-          debugLog("Username does not exist, creating new user");
-          // Username doesn't exist - create new account
+          // Alias does not exist in network - create new account
+          debugLog("Alias does not exist in network, creating new user");
           proceedWithAuth(deterministicPair, null);
         }
       }
       
-      // Set timeout for username check (2 seconds)
+      // Set timeout for alias check (5 seconds - increased for slow networks)
       checkTimeout = setTimeout(() => {
         if (checksDone < 2) {
+          debugLog(`Alias check timeout reached for "${alias}" - proceeding without network confirmation`);
           checksDone = 2;
           checkComplete();
         }
-      }, 2000);
+      }, 5000);
       
-      // Check if username exists in alias index
-      aliasNode.once((data) => {
-        if (checksDone >= 2) return;
+      // Check if alias exists in the network (alias index)
+      // Use .on() with unsubscribe to wait for network sync
+      let aliasCheckAttempts = 0;
+      const maxAliasCheckAttempts = 3;
+      const aliasCheckInterval = 1000; // 1 second between retries
+      
+      function performAliasCheck() {
+        aliasCheckAttempts++;
+        debugLog(`Alias check attempt ${aliasCheckAttempts}/${maxAliasCheckAttempts} for "${alias}"`);
         
-        // Extract public key from the alias node
-        if (data && typeof data === 'object') {
-          // Gun stores data as { "~pubkey": { "#": "~pubkey" } }
-          const keys = Object.keys(data);
-          for (const key of keys) {
-            // Skip Gun internal keys
-            if (key === '_' || key.startsWith('_')) continue;
-            // Extract public key (remove ~ prefix)
-            if (key.startsWith('~')) {
-              existingPub = key.replace('~', '');
-              break;
+        aliasNode.once((data) => {
+          if (checksDone >= 2) return;
+          
+          debugLog(`Alias node check for "${alias}" returned:`, data ? Object.keys(data) : 'null');
+          
+          // Check if alias exists and extract associated public key
+          if (data && typeof data === 'object') {
+            // Gun stores data as { "~pubkey": { "#": "~pubkey" } }
+            const keys = Object.keys(data);
+            for (const key of keys) {
+              // Skip Gun internal keys
+              if (key === '_' || key.startsWith('_')) continue;
+              // Extract public key (remove ~ prefix)
+              if (key.startsWith('~')) {
+                aliasExists = true;  // Alias exists in network
+                existingPub = key.replace('~', '');
+                debugLog(`Found existing alias "${alias}" with pub: ${existingPub?.substring(0, 20)}...`);
+                break;
+              }
             }
           }
-        }
-        
-        checkComplete();
-      });
+          
+          // If alias found OR max attempts reached, complete
+          if (aliasExists || aliasCheckAttempts >= maxAliasCheckAttempts) {
+            if (!aliasExists) {
+              debugLog(`Alias "${alias}" not found after ${aliasCheckAttempts} attempts`);
+            }
+            checkComplete();
+          } else {
+            // Retry after delay
+            debugLog(`Alias not found, retrying in ${aliasCheckInterval}ms...`);
+            setTimeout(performAliasCheck, aliasCheckInterval);
+          }
+        });
+      }
+      
+      // Start alias check
+      performAliasCheck();
       
       // Also check if user node exists (in case index hasn't been written yet)
       userNode.once((data) => {
@@ -427,6 +663,10 @@ function applyAuthOverride() {
       }
       
       debugLog("Auth successful, pub:", deterministicPair.pub.slice(0, 20) + "...");
+      
+      // Reset rate limit on successful auth
+      resetRateLimit(alias);
+      
       if (cb) cb(ack);
       
       // Write global index and user profile (background)
@@ -491,13 +731,133 @@ Gun.chain.verifyPassword = async function(expectedPub, username, password) {
   return verifyPassword(expectedPub, username, password);
 };
 
+/**
+ * Check if an alias already exists in the network
+ * @param {string} alias - The alias to check
+ * @param {number} timeout - Timeout in ms (default: 2000)
+ * @param {function} cb - Callback function (err, exists, pub)
+ * @returns {Promise<{exists: boolean, pub: string|null}>} - Object with exists flag and associated pub key
+ */
+Gun.chain.checkAliasExists = function(alias, timeout = 2000, cb) {
+  const gun = this.back(-1);
+  const root = gun.back(-1);
+  
+  if (!alias || typeof alias !== 'string' || !alias.trim()) {
+    const error = "Alias must be a non-empty string";
+    if (cb) cb(error, false, null);
+    return Promise.resolve({ exists: false, pub: null });
+  }
+  
+  const normalizedAlias = normalizeString(alias);
+  const aliasNode = root.get('~@' + normalizedAlias);
+  
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const result = { exists: false, pub: null };
+      if (cb) cb(null, false, null);
+      resolve(result);
+    }, timeout);
+    
+    aliasNode.once((data) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      
+      let existingPub = null;
+      if (data && typeof data === 'object') {
+        const keys = Object.keys(data);
+        for (const key of keys) {
+          if (key === '_' || key.startsWith('_')) continue;
+          if (key.startsWith('~')) {
+            existingPub = key.replace('~', '');
+            break;
+          }
+        }
+      }
+      
+      const exists = !!existingPub;
+      const result = { exists, pub: existingPub };
+      if (cb) cb(null, exists, existingPub);
+      resolve(result);
+    });
+  });
+};
+
+// --- HELPER FUNCTION FOR ALIAS CHECK ---
+
+/**
+ * Check if an alias exists in the network (standalone function)
+ * @param {Gun} gunInstance - Gun instance
+ * @param {string} alias - The alias to check
+ * @param {number} timeout - Timeout in ms (default: 2000)
+ * @returns {Promise<{exists: boolean, pub: string|null}>}
+ */
+async function checkAliasExists(gunInstance, alias, timeout = 2000) {
+  if (!alias || typeof alias !== 'string' || !alias.trim()) {
+    return { exists: false, pub: null };
+  }
+  
+  const root = gunInstance.back(-1);
+  const normalizedAlias = normalizeString(alias);
+  const aliasNode = root.get('~@' + normalizedAlias);
+  
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ exists: false, pub: null });
+    }, timeout);
+    
+    aliasNode.once((data) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      
+      let existingPub = null;
+      if (data && typeof data === 'object') {
+        const keys = Object.keys(data);
+        for (const key of keys) {
+          if (key === '_' || key.startsWith('_')) continue;
+          if (key.startsWith('~')) {
+            existingPub = key.replace('~', '');
+            break;
+          }
+        }
+      }
+      
+      resolve({ exists: !!existingPub, pub: existingPub });
+    });
+  });
+}
+
 // --- NAMESPACE EXPORT ---
 const GunAuthd = {
+  // Core functions
   generatePair: generateDeterministicPair,
   validatePassword: validatePasswordStrength,
+  validatePin: validatePin,
   verifyPassword: verifyPassword,
+  checkAliasExists: checkAliasExists,
+  
+  // Rate limiting
+  checkRateLimit: checkRateLimit,
+  resetRateLimit: resetRateLimit,
+  
+  // Utilities
   enableDebug: enableDebug,
-  config: ARGON2_CONFIG,
+  secureWipe: secureWipe,  
+  
+  // Configuration
+  config: {
+    argon2: ARGON2_CONFIG,
+    password: PASSWORD_CONFIG,
+    pin: PIN_CONFIG,
+    rateLimit: RATE_LIMIT_CONFIG,
+  },
   version: LIB_VERSION,
 };
 
@@ -507,10 +867,17 @@ Gun.authd = GunAuthd;
 // ES Module exports (for direct import)
 export { 
   generateDeterministicPair, 
-  validatePasswordStrength, 
+  validatePasswordStrength,
+  validatePin,
   verifyPassword,
+  checkAliasExists,
+  checkRateLimit,
+  resetRateLimit,
   enableDebug,
+  secureWipe,
   ARGON2_CONFIG,
+  PASSWORD_CONFIG,
+  PIN_CONFIG,
+  RATE_LIMIT_CONFIG,
   GunAuthd as default
 };
-
