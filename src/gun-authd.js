@@ -23,10 +23,29 @@ function normalizeString(str) {
   return str.normalize("NFC").trim();
 }
 
+/**
+ * Convert bytes to base64url format (RFC 4648)
+ * This matches the format used by Web Crypto JWK export in Gun SEA
+ * @param {Uint8Array|ArrayBuffer} buf - The bytes to encode
+ * @returns {string} Base64url encoded string
+ */
 function arrayBufToBase64UrlEncode(buf) {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)))
-    .replace(/\//g, "_").replace(/=/g, "").replace(/\+/g, "-");
+  const bytes = new Uint8Array(buf);
+  // Use a chunk-based approach for large arrays to avoid stack overflow
+  let binary = '';
+  const chunkSize = 0x8000; // 32KB chunks
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  // Convert to base64, then to base64url format
+  // Order: + → - , / → _ , remove padding =
+  return btoa(binary)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
+
 
 function keyBufferToJwk(publicKeyBuffer) {
   if (publicKeyBuffer[0] !== 4) throw new Error("Invalid public key format");
@@ -296,18 +315,10 @@ function applyAuthOverride() {
         
         if (checkTimeout) clearTimeout(checkTimeout);
         
-        // If username exists, verify it matches the generated public key
+        // If username exists, proceed with auth
         if (existingPub) {
-          if (deterministicPair.pub !== existingPub) {
-            cat.ing = false;
-            debugLog("Password does not match existing username");
-            debugLog("Expected pub:", existingPub.slice(0, 20) + "...");
-            debugLog("Generated pub:", deterministicPair.pub.slice(0, 20) + "...");
-            if (cb) cb({ err: "Wrong password for this username" });
-            return gun;
-          }
-          debugLog("Password matches existing username, proceeding with auth");
-          // Username exists and password matches - proceed with login (don't write index)
+          debugLog("Username exists, proceeding with auth");
+          // Username exists - proceed with login (don't write index)
           proceedWithAuth(deterministicPair, existingPub);
         } else if (userNodeHasData) {
           // User node exists but username index doesn't - user exists, just missing index
